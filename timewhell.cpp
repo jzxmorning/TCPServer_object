@@ -1,5 +1,10 @@
 #include<iostream>
-
+#include<vector>
+#include<unordered_map>
+#include <functional>
+#include <memory>
+#include <unistd.h>
+#include <cstdint>
 
 
 using TaskFun =std::function<void()>;
@@ -26,7 +31,7 @@ class Task
     {
         _iscancel=true;
     }
-    void SetRelease(ReleaseFun &cb)
+    void SetRelease(const ReleaseFun &cb)
     {
         _release=cb;
     }
@@ -45,12 +50,13 @@ class Task
 class TimeWhell
 {
     public:
+
     void RvmTimer(uint64_t id)
     {
         auto it=_timer.find(id);
-        if(it!=_timeer.end())
+        if(it!=_timer.end())
         {
-            _timeer.erase(it);
+            _timer.erase(it);
         }
     }
     public:
@@ -58,25 +64,28 @@ class TimeWhell
     {
         TaskPtr p(new Task(id,timeout,fun));
         p->SetRelease(std::bind(&TimeWhell::RvmTimer,this,id));
-        _timeer[id]=WeakPtr(p);
+        _timer[id]=WeakPtr(p);
         int pos = (ticket+timeout)%capacity;
         _Timewhell[pos].push_back(p);
     }
     void flush(uint64_t id)
     {
         auto it=_timer.find(id);
-        if(it!=_timeer.end())
+        if(it!=_timer.end())
         {
            TaskPtr p1=it->second.lock();
-           int pos =(ticket+p1->timeout)%capacity;
-           _timeer[pos].push_back(p1);
+           if(p1)
+           {
+            int pos =(ticket+p1->Timeout())%capacity;
+           _Timewhell[pos].push_back(p1);
+           }
         }
         return;
     }
     void cancel(uint64_t id)
     {
-        auto it =_timeer.find(id);
-        if(it!=_timeer.end())
+        auto it =_timer.find(id);
+        if(it!=_timer.end())
         {
             TaskPtr p=it->second.lock();
             if(p)
@@ -91,11 +100,57 @@ class TimeWhell
         ticket=(ticket+1)%capacity;
         _Timewhell[ticket].clear();
     }
+    TimeWhell()
+    :ticket(0)
+    ,capacity(60)
+    ,_Timewhell(capacity)
+    {
+    }
     private:
     using TaskPtr = std::shared_ptr<Task>;
     using WeakPtr = std::weak_ptr<Task>;
     int ticket;//指针;
     int capacity;//大小
-    std::vactor<std::vector<TaskPtr>> _Timewhell;
-    std::unordered_map<int,WeakPtr> _timer;
+    std::vector<std::vector<TaskPtr>> _Timewhell;
+    std::unordered_map<uint64_t,WeakPtr> _timer;
 };
+
+class T
+{
+    public:
+    T()
+    {
+        std::cout<<"构造函数"<<std::endl;
+    }
+    ~T()
+    {
+        std::cout<<"析构函数"<<std::endl;
+    }
+};
+
+
+void task(T* text)
+{
+    delete text;
+}
+int main()
+{
+    TimeWhell t;
+    T * text=new T;
+    t.addtimewhell(1,5,std::bind(task,text));
+    int cnt=3;
+    while(cnt--)
+    {
+        t.Run();
+        t.flush(1);
+        std::cout<<"1 号任务推迟"<<std::endl;
+        sleep(1);
+    }
+    while(1)
+    {
+        t.Run();
+        std::cout<<"-----------------------"<<std::endl;
+         sleep(1);
+    }
+    return 0;
+}
