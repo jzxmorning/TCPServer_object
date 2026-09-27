@@ -2,10 +2,15 @@
 #include "Log.hpp"
 #include <vector>
 #include <iostream>
+#include <functional>
 #include <assert.h>
+#include <mutex>
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <sys/eventfd.h>
+#include <unordered_map>
+#include <thread>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -13,6 +18,7 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <sys/epoll.h>
 #define DEFAULT_BUFFER_SIZE 1024
 using namespace LogMoudle;
 class Buffer
@@ -179,13 +185,6 @@ public:
     }
 };
 
-
-
-
-
-
-
-
 #define MAX_LISTEN 1024
 class Socket
 {
@@ -198,7 +197,7 @@ public:
     {
     }
     Socket(int fd)
-    :_sockfd(fd)
+        : _sockfd(fd)
     {
     }
     int Fd()
@@ -326,7 +325,8 @@ public:
         {
             return false;
         }
-         if (block_flag) NonBlock();
+        if (block_flag)
+            NonBlock();
         if (Bind(ip, port) == false)
         {
             return false;
@@ -364,5 +364,446 @@ public:
         // int fcntl(int fd, int cmd, ... /* arg */ );
         int flag = fcntl(_sockfd, F_GETFL, 0);
         fcntl(_sockfd, F_SETFL, flag | O_NONBLOCK);
+    }
+};
+
+class Channel
+{
+public:
+    Channel(int fd)
+        : _fd(fd), _events(0), _revents(0)
+    {
+    }
+    int Fd()
+    {
+        return _fd;
+    }
+    uint32_t Event()
+    {
+        return _events;
+    }
+    void SetRevent(uint32_t event)
+    {
+        _revents = event;
+    }
+    bool EventReadable()
+    {
+        return (_events & EPOLLIN);
+    }
+    bool EventWriteable()
+    {
+        return (_events & EPOLLOUT);
+    }
+    void SetReadEvent()
+    {
+        _events |= EPOLLIN;
+        Update();
+    }
+    void SetWriteEvent()
+    {
+        _events |= EPOLLOUT;
+        Update();
+    }
+    void RevReadEvent()
+    {
+        _events = _events | (~EPOLLIN);
+        Update();
+    }
+    void RevWriteEvent()
+    {
+        _events = _events | (~EPOLLOUT);
+        Update();
+    }
+    void RevAll()
+    {
+        _events = 0;
+        Update();
+    }
+    void Update();
+    void Rev();
+
+private:
+    int _fd;
+    uint32_t _events;  // 需要监控的事件；
+    uint32_t _revents; // 就绪的事件；
+    using EventCallBack = std::function<void()>;
+    EventCallBack ReadCallBack;   // 读事件就绪回调函数；
+    EventCallBack WriteCallBack;  // 写事件就绪回调函数
+    EventCallBack ErrorCallBack;  // 错误事件就绪回调函数；
+    EventCallBack CloseCallBack;  // 关闭事件就绪回调函数；
+    EventCallBack _EventCallBack; // 任意事件就绪回调函数；
+
+public:
+    void SetReadCallBack(const EventCallBack &cb)
+    {
+        ReadCallBack = cb;
+    }
+    void SetWriteCallBack(const EventCallBack &cb)
+    {
+        WriteCallBack = cb;
+    }
+    void SetErrorCallBack(const EventCallBack &cb)
+    {
+        ErrorCallBack = cb;
+    }
+    void SetCloseCallBack(const EventCallBack &cb)
+    {
+        CloseCallBack = cb;
+    }
+    void SetEvevtCallBack(const EventCallBack &cb)
+    {
+        _EventCallBack = cb;
+    }
+    void HandleEvent()
+    {
+        if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI))
+        {
+            if (ReadCallBack)
+            {
+                ReadCallBack();
+            }
+        }
+        // 因为可能会释放连接所以只能执行一个。
+        if (_revents & EPOLLOUT)
+        {
+            if (WriteCallBack)
+            {
+                WriteCallBack();
+            }
+        }
+        else if (_revents & EPOLLERR)
+        {
+            if (ErrorCallBack)
+            {
+                ErrorCallBack(); // 在这样可能会直接释放连接；
+            }
+        }
+        else if (_revents & EPOLLHUP)
+        {
+            if (CloseCallBack)
+            {
+                CloseCallBack();
+            }
+        }
+        // 都要进行的回调函数。
+        if (_EventCallBack)
+        {
+            _EventCallBack();
+        }
+    }
+};
+
+#define MAX_EPOLLEVENT 1024
+class Poller
+{
+public:
+    Poller()
+    {
+        _epfd = epoll_create1(MAX_EPOLLEVENT);
+        if (_epfd < 0)
+        {
+            LOG(LogLevel::ERROR) << "epoll_create error";
+            abort();
+        }
+    }
+    void Update(Channel *channel, int op)
+    {
+        int fd = channel->Fd();
+        struct epoll_event env;
+        env.data.fd = fd;
+        env.events = channel->Event();
+        int ret = epoll_ctl(_epfd, op, fd, &env);
+        if (ret < 0)
+        {
+            LOG(LogLevel::ERROR) << "epoll_ctrl error";
+        }
+        return;
+    }
+    bool HasChannel(Channel *target)
+    {
+        int fd = target->Fd();
+        auto it = _channel.find(fd);
+        if (it == _channel.end())
+        {
+            return false;
+        }
+        return true;
+    }
+    void UpdateEvent(Channel *channel)
+    {
+        bool ret = HasChannel(channel);
+        if (ret == true)
+        {
+            // 修改事件监控
+            return Update(channel, EPOLL_CTL_MOD);
+        }
+        else
+        {
+            _channel.insert({channel->Fd(), channel});
+            return Update(channel, EPOLL_CTL_ADD);
+        }
+    }
+    void RevEvent(Channel *channel)
+    {
+        auto it = _channel.find(channel->Fd());
+        if (it != _channel.end())
+        {
+            _channel.erase(it);
+        }
+        Update(channel, EPOLL_CTL_DEL);
+    }
+    void Poll(std::vector<Channel *> *active)
+    {
+        int nfd = epoll_wait(_epfd, _env, MAX_EPOLLEVENT, -1);
+        if (nfd < 0)
+        {
+            LOG(LogLevel::ERROR) << "epoll_wait error";
+            abort();
+        }
+        for (int i = 0; i < nfd; i++)
+        {
+            auto it = _channel.find(_env[i].data.fd);
+            assert(it != _channel.end());
+            it->second->SetRevent(_env[i].events);
+            active->push_back(it->second);
+        }
+        return;
+    }
+
+private:
+    int _epfd;
+    struct epoll_event _env[MAX_EPOLLEVENT];
+    std::unordered_map<int, Channel *> _channel;
+};
+
+using TaskFun = std::function<void()>;
+using ReleaseFun = std::function<void()>;
+class Task
+{
+public:
+    Task(uint64_t id, uint32_t timeout, const TaskFun &fun)
+        : _id(id), _timeout(timeout), _func(fun), _iscancel(false)
+    {
+    }
+    ~Task()
+    {
+        if (_iscancel == false)
+        {
+            _func();
+        }
+        _release();
+    }
+    void Setcancel()
+    {
+        _iscancel = true;
+    }
+    void SetRelease(const ReleaseFun &cb)
+    {
+        _release = cb;
+    }
+    uint32_t Timeout()
+    {
+        return _timeout;
+    }
+
+private:
+    uint64_t _id;        // 任务对象的ID；
+    uint32_t _timeout;   // 时间超限的设置；
+    bool _iscancel;      // 是否取消任务的执行；
+    TaskFun _func;       // 任务的回调函数；
+    ReleaseFun _release; // 清除在时间轮中的信息；
+};
+
+class TimeWhell
+{
+public:
+    void RvmTimer(uint64_t id)
+    {
+        auto it = _timer.find(id);
+        if (it != _timer.end())
+        {
+            _timer.erase(it);
+        }
+    }
+
+public:
+    void addtimewhell(uint64_t id, uint32_t timeout, const TaskFun &fun)
+    {
+        TaskPtr p(new Task(id, timeout, fun));
+        p->SetRelease(std::bind(&TimeWhell::RvmTimer, this, id));
+        _timer[id] = WeakPtr(p);
+        int pos = (ticket + timeout) % capacity;
+        _Timewhell[pos].push_back(p);
+    }
+    void flush(uint64_t id)
+    {
+        auto it = _timer.find(id);
+        if (it != _timer.end())
+        {
+            TaskPtr p1 = it->second.lock();
+            if (p1)
+            {
+                int pos = (ticket + p1->Timeout()) % capacity;
+                _Timewhell[pos].push_back(p1);
+            }
+        }
+        return;
+    }
+    void cancel(uint64_t id)
+    {
+        auto it = _timer.find(id);
+        if (it != _timer.end())
+        {
+            TaskPtr p = it->second.lock();
+            if (p)
+            {
+                p->Setcancel();
+            }
+        }
+        return;
+    }
+    void Run()
+    {
+        ticket = (ticket + 1) % capacity;
+        _Timewhell[ticket].clear();
+    }
+    TimeWhell()
+        : ticket(0), capacity(60), _Timewhell(capacity)
+    {
+    }
+
+private:
+    using TaskPtr = std::shared_ptr<Task>;
+    using WeakPtr = std::weak_ptr<Task>;
+    int ticket;   // 指针;
+    int capacity; // 大小
+    std::vector<std::vector<TaskPtr>> _Timewhell;
+    std::unordered_map<uint64_t, WeakPtr> _timer;
+};
+
+class EventLoop
+{
+public:
+    void RunTask()
+    {
+        std::vector<Functor> func;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            std::swap(func, _runv);
+        }
+        for (auto &V : func)
+        {
+            V();
+        }
+        return;
+    }
+    void ReadEvent()
+    {
+        uint64_t val;
+        int ret = read(_event_fd, &val, sizeof(val));
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+            {
+                return;
+            }
+            LOG(LogLevel::ERROR) << "readevent error";
+            abort();
+        }
+        return;
+    }
+    void WeakUpRun()
+    {
+        uint64_t val = 1;
+        int ret = write(_event_fd, &val, sizeof(val));
+        if (ret < 0)
+        {
+            if (errno == EINTR || errno == EAGAIN)
+            {
+                return;
+            }
+            LOG(LogLevel::ERROR) << "weakup error";
+            abort();
+        }
+        return;
+    }
+    void Start()
+    {
+        while (1)
+        {
+            std::vector<Channel *> active;
+            _poll.Poll(&active);
+            for (auto &V : active)
+            {
+                V->HandleEvent();
+            }
+            RunTask();
+        }
+    }
+
+private:
+    using Functor = std::function<void()>;
+    std::thread::id _thread_id;
+    int _event_fd;
+    Channel _event_channel;
+    std::vector<Functor> _runv;
+    Poller _poll;
+    std::mutex _mutex;
+
+public:
+    void QueueInLoop(const Functor &cb)
+    {
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _runv.push_back(cb);
+        }
+        WeakUpRun();
+    }
+    bool IsInLoop()
+    {
+        return (_thread_id==std::this_thread::get_id());
+    }
+    void AssertInLoop()
+    {
+        assert(IsInLoop());
+    }
+    void RunInLoop(const Functor & cb)
+    {
+        if(IsInLoop())
+        {
+            cb();
+        }else
+        {
+            QueueInLoop(cb);
+        }
+    }
+    static int CreateEventFd()
+    {
+        int efd= eventfd(0,EFD_CLOEXEC | EFD_NONBLOCK);
+        if(efd < 0 )
+        {
+             if (errno == EINTR || errno == EAGAIN) {
+                    return;
+            LOG(LogLevel::ERROR)<<"eventfd error";
+            abort();
+        }
+        return efd;
+    }
+    }
+    EventLoop()
+    :_thread_id(std::this_thread::get_id())
+    ,_event_fd(CreateEventFd())
+    ,_event_channel(_event_fd)
+    {
+        _event_channel.SetReadCallBack(std::bind(&EventLoop::ReadEvent,this));
+        _event_channel.SetReadEvent();
+    }
+    void EventUpdate_eventloop(Channel * channel)
+    {
+        _poll.UpdateEvent(channel);
+    }
+    void EventRev_eventloop(Channel* channel)
+    {
+        _poll.RevEvent(channel);
     }
 };
