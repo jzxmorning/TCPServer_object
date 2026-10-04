@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/timerfd.h>
 #include <netdb.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
@@ -366,12 +367,13 @@ public:
         fcntl(_sockfd, F_SETFL, flag | O_NONBLOCK);
     }
 };
-
+class EventLoop;
 class Channel
 {
 public:
-    Channel(int fd)
+    Channel(int fd,EventLoop* loop)
         : _fd(fd), _events(0), _revents(0)
+        ,_loop(loop)
     {
     }
     int Fd()
@@ -406,12 +408,12 @@ public:
     }
     void RevReadEvent()
     {
-        _events = _events | (~EPOLLIN);
+        _events = _events & (~EPOLLIN);
         Update();
     }
     void RevWriteEvent()
     {
-        _events = _events | (~EPOLLOUT);
+        _events = _events & (~EPOLLOUT);
         Update();
     }
     void RevAll()
@@ -423,6 +425,7 @@ public:
     void Rev();
 
 private:
+    EventLoop* _loop;
     int _fd;
     uint32_t _events;  // 需要监控的事件；
     uint32_t _revents; // 就绪的事件；
@@ -667,9 +670,66 @@ public:
         ticket = (ticket + 1) % capacity;
         _Timewhell[ticket].clear();
     }
-    TimeWhell()
-        : ticket(0), capacity(60), _Timewhell(capacity)
+
+    static int Createtimefd()
     {
+        int timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+        if (timerfd < 0)
+        {
+            LOG(LogLevel::ERROR) << "create timefd error";
+            return -1;
+        }
+        struct itimerspec itime;
+        itime.it_value.tv_sec = 1;
+        itime.it_value.tv_nsec = 0;
+        itime.it_interval.tv_sec = 1;
+        itime.it_interval.tv_nsec = 0;
+        timerfd_settime(timerfd, 0, &itime, NULL);
+        return timerfd;
+    }
+    bool HasTimer(uint64_t id)
+    {
+         auto it = _timer.find(id);
+        if (it != _timer.end())
+        {
+            return true;
+        }else
+        {
+            return false;
+        }
+    }
+    int Readtimefd()
+    {
+        uint64_t times;
+        int ret = read(_timefd, &times, sizeof(times));
+        if (ret < 0)
+        {
+            LOG(LogLevel::ERROR) << "read error";
+            abort();
+        }
+        return times;
+    }
+
+    void OnTime()
+    {
+        int ret = Readtimefd();
+        for (int i = 0; i < ret; i++)
+        {
+            Run();
+        }
+    }
+
+    TimeWhell(EventLoop* loop)
+        : ticket(0)
+        , capacity(60)
+        , _Timewhell(capacity)
+        ,loop(loop)
+        ,_timefd(Createtimefd())
+        ,_timer_channel(_timefd,loop)
+    {
+        _timer_channel.SetReadCallBack(std::bind(&TimeWhell::OnTime,this));
+        _timer_channel.SetReadEvent();
+
     }
 
 private:
@@ -679,6 +739,10 @@ private:
     int capacity; // 大小
     std::vector<std::vector<TaskPtr>> _Timewhell;
     std::unordered_map<uint64_t, WeakPtr> _timer;
+
+    EventLoop *loop;
+    int _timefd;
+    Channel _timer_channel;
 };
 
 class EventLoop
@@ -749,7 +813,7 @@ private:
     std::vector<Functor> _runv;
     Poller _poll;
     std::mutex _mutex;
-
+    TimeWhell _time_whell; 
 public:
     void QueueInLoop(const Functor &cb)
     {
@@ -761,49 +825,65 @@ public:
     }
     bool IsInLoop()
     {
-        return (_thread_id==std::this_thread::get_id());
+        return (_thread_id == std::this_thread::get_id());
     }
     void AssertInLoop()
     {
         assert(IsInLoop());
     }
-    void RunInLoop(const Functor & cb)
+    void RunInLoop(const Functor &cb)
     {
-        if(IsInLoop())
+        if (IsInLoop())
         {
             cb();
-        }else
+        }
+        else
         {
             QueueInLoop(cb);
         }
     }
     static int CreateEventFd()
     {
-        int efd= eventfd(0,EFD_CLOEXEC | EFD_NONBLOCK);
-        if(efd < 0 )
+        int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (efd < 0)
         {
-             if (errno == EINTR || errno == EAGAIN) {
-                    return;
-            LOG(LogLevel::ERROR)<<"eventfd error";
-            abort();
+            if (errno == EINTR || errno == EAGAIN)
+            {
+                return;
+                LOG(LogLevel::ERROR) << "eventfd error";
+                abort();
+            }
+            return efd;
         }
-        return efd;
-    }
     }
     EventLoop()
-    :_thread_id(std::this_thread::get_id())
-    ,_event_fd(CreateEventFd())
-    ,_event_channel(_event_fd)
+        : _thread_id(std::this_thread::get_id()), _event_fd(CreateEventFd()), _event_channel(_event_fd,this),_time_whell(this)
     {
-        _event_channel.SetReadCallBack(std::bind(&EventLoop::ReadEvent,this));
+        _event_channel.SetReadCallBack(std::bind(&EventLoop::ReadEvent, this));
         _event_channel.SetReadEvent();
     }
-    void EventUpdate_eventloop(Channel * channel)
+    void EventUpdate_eventloop(Channel *channel)
     {
         _poll.UpdateEvent(channel);
     }
-    void EventRev_eventloop(Channel* channel)
+    void EventRev_eventloop(Channel *channel)
     {
         _poll.RevEvent(channel);
     }
+    void TimerAdd(uint64_t id,uint32_t delay,const TaskFun &cb)
+    {
+        _time_whell.addtimewhell(id,delay,cb);
+    }
+   void TimerRefesh(uint64_t id)
+   {
+    _time_whell.flush(id);
+   }
+   void TimerCancel(uint64_t id)
+   {
+    _time_whell.cancel(id);
+   }
+   bool HasTimer(uint64_t id)
+   {
+    return _time_whell.HasTimer(id);
+   }     
 };
