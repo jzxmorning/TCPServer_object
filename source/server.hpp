@@ -371,9 +371,8 @@ class EventLoop;
 class Channel
 {
 public:
-    Channel(int fd,EventLoop* loop)
-        : _fd(fd), _events(0), _revents(0)
-        ,_loop(loop)
+    Channel(int fd, EventLoop *loop)
+        : _fd(fd), _events(0), _revents(0), _loop(loop)
     {
     }
     int Fd()
@@ -425,7 +424,7 @@ public:
     void Rev();
 
 private:
-    EventLoop* _loop;
+    EventLoop *_loop;
     int _fd;
     uint32_t _events;  // 需要监控的事件；
     uint32_t _revents; // 就绪的事件；
@@ -619,7 +618,7 @@ private:
 
 class TimeWhell
 {
-public:
+private:
     void RvmTimer(uint64_t id)
     {
         auto it = _timer.find(id);
@@ -628,9 +627,7 @@ public:
             _timer.erase(it);
         }
     }
-
-public:
-    void addtimewhell(uint64_t id, uint32_t timeout, const TaskFun &fun)
+    void addtimewhellInLoop(uint64_t id, uint32_t timeout, const TaskFun &fun)
     {
         TaskPtr p(new Task(id, timeout, fun));
         p->SetRelease(std::bind(&TimeWhell::RvmTimer, this, id));
@@ -638,7 +635,7 @@ public:
         int pos = (ticket + timeout) % capacity;
         _Timewhell[pos].push_back(p);
     }
-    void flush(uint64_t id)
+    void flushInLoop(uint64_t id)
     {
         auto it = _timer.find(id);
         if (it != _timer.end())
@@ -652,7 +649,7 @@ public:
         }
         return;
     }
-    void cancel(uint64_t id)
+    void cancelInLoop(uint64_t id)
     {
         auto it = _timer.find(id);
         if (it != _timer.end())
@@ -687,17 +684,6 @@ public:
         timerfd_settime(timerfd, 0, &itime, NULL);
         return timerfd;
     }
-    bool HasTimer(uint64_t id)
-    {
-         auto it = _timer.find(id);
-        if (it != _timer.end())
-        {
-            return true;
-        }else
-        {
-            return false;
-        }
-    }
     int Readtimefd()
     {
         uint64_t times;
@@ -719,19 +705,6 @@ public:
         }
     }
 
-    TimeWhell(EventLoop* loop)
-        : ticket(0)
-        , capacity(60)
-        , _Timewhell(capacity)
-        ,loop(loop)
-        ,_timefd(Createtimefd())
-        ,_timer_channel(_timefd,loop)
-    {
-        _timer_channel.SetReadCallBack(std::bind(&TimeWhell::OnTime,this));
-        _timer_channel.SetReadEvent();
-
-    }
-
 private:
     using TaskPtr = std::shared_ptr<Task>;
     using WeakPtr = std::weak_ptr<Task>;
@@ -743,6 +716,29 @@ private:
     EventLoop *loop;
     int _timefd;
     Channel _timer_channel;
+
+public:
+    TimeWhell(EventLoop *loop)
+        : ticket(0), capacity(60), _Timewhell(capacity), loop(loop), _timefd(Createtimefd()), _timer_channel(_timefd, loop)
+    {
+        _timer_channel.SetReadCallBack(std::bind(&TimeWhell::OnTime, this));
+        _timer_channel.SetReadEvent();
+    }
+    bool HasTimer(uint64_t id)
+    {
+        auto it = _timer.find(id);
+        if (it != _timer.end())
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    void cancel(uint64_t id);
+    void addtimewhell(uint64_t id, uint32_t timeout, const TaskFun &fun);
+    void flush(uint64_t id);
 };
 
 class EventLoop
@@ -813,7 +809,8 @@ private:
     std::vector<Functor> _runv;
     Poller _poll;
     std::mutex _mutex;
-    TimeWhell _time_whell; 
+    TimeWhell _time_whell;
+
 public:
     void QueueInLoop(const Functor &cb)
     {
@@ -857,7 +854,7 @@ public:
         }
     }
     EventLoop()
-        : _thread_id(std::this_thread::get_id()), _event_fd(CreateEventFd()), _event_channel(_event_fd,this),_time_whell(this)
+        : _thread_id(std::this_thread::get_id()), _event_fd(CreateEventFd()), _event_channel(_event_fd, this), _time_whell(this)
     {
         _event_channel.SetReadCallBack(std::bind(&EventLoop::ReadEvent, this));
         _event_channel.SetReadEvent();
@@ -870,20 +867,367 @@ public:
     {
         _poll.RevEvent(channel);
     }
-    void TimerAdd(uint64_t id,uint32_t delay,const TaskFun &cb)
+    void TimerAdd(uint64_t id, uint32_t delay, const TaskFun &cb)
     {
-        _time_whell.addtimewhell(id,delay,cb);
+        _time_whell.addtimewhell(id, delay, cb);
     }
-   void TimerRefesh(uint64_t id)
-   {
-    _time_whell.flush(id);
-   }
-   void TimerCancel(uint64_t id)
-   {
-    _time_whell.cancel(id);
-   }
-   bool HasTimer(uint64_t id)
-   {
-    return _time_whell.HasTimer(id);
-   }     
+    void TimerRefesh(uint64_t id)
+    {
+        _time_whell.flush(id);
+    }
+    void TimerCancel(uint64_t id)
+    {
+        _time_whell.cancel(id);
+    }
+    bool HasTimer(uint64_t id)
+    {
+        return _time_whell.HasTimer(id);
+    }
 };
+
+class Any
+{
+private:
+    class holder
+    {
+    public:
+        virtual ~holder() {}
+        virtual const std::type_info &type() = 0;
+        virtual holder *clone() = 0;
+    };
+    template <class T>
+    class placeholder : public holder
+    {
+    public:
+        T _val;
+
+    public:
+        placeholder(const T &val)
+        {
+            _val = val;
+        }
+        virtual holder *clone()
+        {
+            return (new placeholder(_val));
+        }
+        virtual const std::type_info &type()
+        {
+            return typeid(T);
+        }
+    };
+    holder *_content;
+
+public:
+    Any()
+    {
+        _content = NULL;
+    }
+    template <class T>
+    Any(const T &val)
+    {
+        _content(new placeholder<T>(val));
+    }
+    Any(const Any &other)
+    {
+        if (other._content == NULL)
+        {
+            _content = NULL;
+        }
+        else
+        {
+            _content = other._content->clone();
+        }
+    }
+    ~Any()
+    {
+        delete _content;
+    }
+    Any &swap(Any &other)
+    {
+        std::swap(*this, other);
+        return *this;
+    }
+    template <class T>
+    T *get()
+    {
+        assert(typeid(T) == _content->type());
+        return &((placeholder<T> *)_content)->_val;
+    }
+    template <class T>
+    Any &operator=(const T &val)
+    {
+        Any temp(val);
+        temp.swap(*this);
+        return *this;
+    }
+    Any &operator=(const Any &other)
+    {
+        Any(other).swap(*this);
+        return *this;
+    }
+};
+
+class Connection;
+typedef enum
+{
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED,
+    DISCONNECTING
+} ConnStatu;
+using PtrConnection = std::shared_ptr<Connection>;
+class Connection : public std::enable_shared_from_this<Connection>
+{
+private:
+    uint64_t _con_id;
+    int _socketfd;
+    Socket _sock;
+    bool _enable_inactive_release;
+    EventLoop *_loop;
+    Channel _channel;
+    Buffer _inbuffer;
+    Buffer _outbuffer;
+    ConnStatu _statu;
+    Any _content;
+    using ConnectedCallback = std::function<void(const PtrConnection &)>;
+    using MessageCallback = std::function<void(const PtrConnection &, Buffer *)>;
+    using ClosedCallback = std::function<void(const PtrConnection &)>;
+    using AnyEventCallback = std::function<void(const PtrConnection &)>;
+    ConnectedCallback _connected_callback;
+    MessageCallback _message_callback;
+    ClosedCallback _closed_callback;
+    AnyEventCallback _event_callback;
+    ClosedCallback _ser_closed_callback;
+
+private:
+    void HandleRead()
+    {
+        char buf[65525];
+        ssize_t ret = _sock.NoBlockRcv(buf, sizeof(buf));
+        if (ret < 0)
+        {
+            if (_inbuffer.ReadAbleSize() > 0)
+            {
+                _message_callback(shared_from_this(), &_inbuffer);
+            }
+            return Release();
+        }
+        _inbuffer.WriteAndPush(buf, ret);
+        if (_inbuffer.ReadAbleSize() > 0)
+        {
+            return _message_callback(shared_from_this(), &_inbuffer);
+        }
+    }
+    void HandleWrite()
+    {
+        ssize_t ret = _sock.NoBlockSend(_outbuffer.ReadPosition(), _outbuffer.ReadAbleSize());
+        if (ret < 0)
+        {
+            if (_inbuffer.ReadAbleSize() > 0)
+            {
+                _message_callback(shared_from_this(), &_inbuffer);
+            }
+            return Release();
+        }
+        _outbuffer.MoveReadOffset(ret);
+        if (_outbuffer.ReadAbleSize() < 0)
+        {
+            _channel.RevWriteEvent();
+        }
+        if (_statu == DISCONNECTING)
+        {
+            return Release();
+        }
+    }
+    void HandleClose()
+    {
+        if (_inbuffer.ReadAbleSize() > 0)
+        {
+            _message_callback(shared_from_this(), &_inbuffer);
+        }
+        return Release();
+    }
+    void HandleError()
+    {
+        return HandleClose();
+    }
+    void HandleEvent()
+    {
+        if (_enable_inactive_release == true)
+        {
+            _loop->TimerRefesh(_con_id);
+        }
+        if (_event_callback)
+        {
+            _event_callback(shared_from_this());
+        }
+    }
+    void EstablishedInloop()
+    {
+        assert(_statu == CONNECTING);
+        _statu = CONNECTED;
+        _channel.SetReadEvent();
+        if (_connected_callback)
+        {
+            _connected_callback(shared_from_this());
+        }
+    }
+    void ReleaseInLoop()
+    {
+        _statu = DISCONNECTED;
+        _sock.Close();
+        _channel.Rev();
+        if (_loop->HasTimer(_con_id))
+        {
+            _loop->TimerCancel(_con_id);
+        }
+        if (_closed_callback)
+        {
+            _closed_callback(shared_from_this());
+        }
+        if (_ser_closed_callback)
+        {
+            _ser_closed_callback(shared_from_this());
+        }
+    }
+    void SendInloop(Buffer &buf)
+    {
+        if (_statu == DISCONNECTED)
+        {
+            return;
+        }
+        _outbuffer.WriteBufferAndPush(buf);
+        if (_channel.EventWriteable() == false)
+        {
+            _channel.SetWriteEvent();
+        }
+    }
+    void ShutdownInLoop()
+    {
+        _statu == DISCONNECTING;
+        if (_inbuffer.ReadAbleSize() > 0)
+        {
+            _message_callback(shared_from_this(), &_inbuffer);
+        }
+        if (_outbuffer.ReadAbleSize() > 0)
+        {
+            if (_channel.EventWriteable() == false)
+            {
+                _channel.SetWriteEvent();
+            }
+        }
+        if (_outbuffer.ReadAbleSize() == 0)
+        {
+            Release();
+        }
+    }
+
+    void EnableInactiveReleaseInLoop(int sec)
+    {
+        _enable_inactive_release = true;
+        if (_loop->HasTimer(_con_id) == true)
+        {
+            return _loop->TimerRefesh(_con_id);
+        }
+        _loop->TimerAdd(_con_id, sec, std::bind(&Connection::Release, this));
+    }
+
+    void CancelInactiveReleaseInLoop()
+    {
+        _enable_inactive_release = false;
+        if (_loop->HasTimer(_con_id) == true)
+        {
+            _loop->TimerCancel(_con_id);
+        }
+    }
+    void UpgradeInLoop(const Any &context,
+                       const ConnectedCallback &conn,
+                       const MessageCallback &msg,
+                       const ClosedCallback &closed,
+                       const AnyEventCallback &event)
+    {
+        _content = context;
+        _connected_callback = conn;
+        _message_callback = msg;
+        _closed_callback = closed;
+        _event_callback = event;
+    }
+
+public:
+    Connection(int con_id, int socketfd, EventLoop *loop)
+        : _channel(_socketfd, loop), _sock(socketfd), _loop(loop), _socketfd(socketfd), _statu(CONNECTING), _enable_inactive_release(false)
+    {
+        _channel.SetCloseCallBack(std::bind(&Connection::HandleClose, this));
+        _channel.SetErrorCallBack(std::bind(&Connection::HandleError, this));
+        _channel.SetReadCallBack(std::bind(&Connection::HandleRead, this));
+        _channel.SetWriteCallBack(std::bind(&Connection::HandleWrite, this));
+        _channel.SetEvevtCallBack(std::bind(&Connection::HandleEvent, this));
+    }
+    ~Connection()
+    {
+    }
+    int Fd() { return _socketfd; }
+    // 获取连接ID
+    int Id() { return _con_id; }
+    // 是否处于CONNECTED状态
+    bool Connected() { return (_statu == CONNECTED); }
+    // 设置上下文--连接建立完成时进行调用
+    void SetContext(const Any &context) { _content = context; }
+    // 获取上下文，返回的是指针
+    Any *GetContext() { return &_content; }
+    void SetConnectedCallback(const ConnectedCallback &cb) { _connected_callback = cb; }
+    void SetMessageCallback(const MessageCallback &cb) { _message_callback = cb; }
+    void SetClosedCallback(const ClosedCallback &cb) { _closed_callback = cb; }
+    void SetAnyEventCallback(const AnyEventCallback &cb) { _event_callback = cb; }
+    void SetSrvClosedCallback(const ClosedCallback &cb) { _ser_closed_callback = cb; }
+    void Established()
+    {
+        _loop->RunInLoop(std::bind(&Connection::EstablishedInloop, this));
+    }
+    void Send(const char *data, size_t len)
+    {
+        Buffer buf;
+        buf.WriteAndPush(data, len);
+        _loop->RunInLoop(std::bind(&Connection::SendInloop, this, buf));
+    }
+    void Shutdown()
+    {
+        _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
+    }
+
+    void Release()
+    {
+        _loop->RunInLoop(std::bind(&Connection::ReleaseInLoop, this));
+    }
+    void EnableInactiveRelease(int sec)
+    {
+        _loop->RunInLoop(std::bind(&Connection::EnableInactiveReleaseInLoop, this, sec));
+    }
+    void CancelInactiveRelease()
+    {
+        _loop->RunInLoop(std::bind(&Connection::CancelInactiveReleaseInLoop, this));
+    }
+    void Upgrade(const Any &context, const ConnectedCallback &conn, const MessageCallback &msg,
+                 const ClosedCallback &closed, const AnyEventCallback &event)
+    {
+        assert(_loop->IsInLoop());
+        _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn, msg, closed, event));
+    }
+};
+
+void Channel::Rev()
+{
+    _loop->EventRev_eventloop(this);
+}
+void TimeWhell::cancel(uint64_t id)
+{
+    loop->RunInLoop(std::bind(&TimeWhell::cancelInLoop,this,id));
+}
+void TimeWhell::addtimewhell(uint64_t id, uint32_t timeout, const TaskFun &fun)
+{
+    loop->RunInLoop(std::bind(&TimeWhell::addtimewhellInLoop,this,id,timeout,fun));
+}
+void TimeWhell::flush(uint64_t id)
+{
+    loop->RunInLoop(std::bind(&TimeWhell::flushInLoop,this,id));
+}
