@@ -1231,3 +1231,53 @@ void TimeWhell::flush(uint64_t id)
 {
     loop->RunInLoop(std::bind(&TimeWhell::flushInLoop,this,id));
 }
+
+
+class Acceptor
+{
+    private:
+    Socket _sock;
+    EventLoop* _loop;
+    Channel _channel;
+    using AcceptCallBack = std::function<void(int)>;
+    AcceptCallBack _acceptcallback;
+    private:
+    void HandleRead()
+    {
+        int newfd = _sock.Accept();
+        if(newfd<0)
+        {
+            LOG(LogLevel::ERROR)<<"accept error";
+            return;
+        }
+        if(_acceptcallback)
+        {
+            _acceptcallback(newfd);
+        }
+    }
+   int CreateServer(int port)
+    {
+        bool ret = _sock.CreateServer(port);
+        if(ret == false)
+        {
+            return;
+        }
+        return _sock.Fd();
+    }
+    public:
+    Acceptor(EventLoop* loop,int port)
+    :_loop(loop)
+    ,_sock(CreateServer(port))
+    ,_channel(_sock.Fd(),loop)
+    {
+        _channel.SetReadCallBack(std::bind(&Acceptor::HandleRead,this));
+    }
+    void Listen()
+    {
+        _channel.RevReadEvent();
+    }
+    void SetAcceptCallBack(AcceptCallBack& cb)
+    {
+        _acceptcallback=cb;
+    }
+};
