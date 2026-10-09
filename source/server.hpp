@@ -2,6 +2,7 @@
 #include "Log.hpp"
 #include <vector>
 #include <iostream>
+#include <condition_variable>
 #include <functional>
 #include <assert.h>
 #include <mutex>
@@ -1279,5 +1280,88 @@ class Acceptor
     void SetAcceptCallBack(AcceptCallBack& cb)
     {
         _acceptcallback=cb;
+    }
+};
+
+class LoopThread
+{
+    private:
+    std::mutex _mutex;
+    std::condition_variable _cond;
+    EventLoop* _loop;
+    std::thread _thread;
+    private:
+      void ThreadEntry()
+      {
+        EventLoop loop;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _loop=&loop;
+            _cond.notify_all();
+        }
+        loop.Start();
+      }
+
+
+    public:
+    LoopThread()
+    :_loop(NULL)
+    ,_thread(std::thread(&LoopThread::ThreadEntry,this))
+    {
+    }
+    EventLoop * Get()
+    {
+       EventLoop* loop=NULL;
+        {
+            std::unique_lock<std::mutex> _lock(_mutex);
+            _cond.wait(_lock,[&](){return _loop!=NULL;});
+            loop=_loop;
+        }
+        return loop;
+    }
+};
+
+
+class LoopThreadPool
+{
+    private:
+    int _thread_count;
+    int _next_id;
+    std::vector<LoopThread*> _threads;
+    std::vector<EventLoop*> _loops;
+    EventLoop* _basicloop;
+    public:
+    LoopThreadPool(EventLoop* basicloop)
+    :_basicloop(basicloop)
+    ,_thread_count(0)
+    ,_next_id(0)
+    {
+    }
+    void Setthreadcount(int n)
+    {
+        _thread_count=n;
+    }
+    void Create()
+    {
+        if(_thread_count>0)
+        {
+            _threads.resize(_thread_count);
+            _loops.resize(_thread_count);
+            for(int i=0;i<_thread_count;i++)
+            {
+                _threads[i]=new LoopThread();
+                _loops[i]=_threads[i]->Get();
+            }
+        }
+        return;
+    }
+    EventLoop* Next()
+    {
+        if(_thread_count==0)
+        {
+            return _basicloop;
+        }
+        _next_id=(_next_id+1)%_thread_count;
+        return _loops[_next_id];
     }
 };
