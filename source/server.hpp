@@ -2,6 +2,7 @@
 #include "Log.hpp"
 #include <vector>
 #include <iostream>
+#include <signal.h>
 #include <condition_variable>
 #include <functional>
 #include <assert.h>
@@ -329,6 +330,7 @@ public:
         }
         if (block_flag)
             NonBlock();
+        ReuseAddress();
         if (Bind(ip, port) == false)
         {
             return false;
@@ -337,7 +339,6 @@ public:
         {
             return false;
         }
-        ReuseAddress();
         return true;
     }
     bool CreateClient(uint16_t port, const std::string &ip)
@@ -502,7 +503,7 @@ class Poller
 public:
     Poller()
     {
-        _epfd = epoll_create1(MAX_EPOLLEVENT);
+        _epfd = epoll_create(MAX_EPOLLEVENT);
         if (_epfd < 0)
         {
             LOG(LogLevel::ERROR) << "epoll_create error";
@@ -847,12 +848,11 @@ public:
         {
             if (errno == EINTR || errno == EAGAIN)
             {
-                return;
                 LOG(LogLevel::ERROR) << "eventfd error";
                 abort();
             }
-            return efd;
         }
+        return efd;
     }
     EventLoop()
         : _thread_id(std::this_thread::get_id()), _event_fd(CreateEventFd()), _event_channel(_event_fd, this), _time_whell(this)
@@ -926,7 +926,7 @@ public:
     template <class T>
     Any(const T &val)
     {
-        _content(new placeholder<T>(val));
+        _content = new placeholder<T>(val);
     }
     Any(const Any &other)
     {
@@ -945,7 +945,7 @@ public:
     }
     Any &swap(Any &other)
     {
-        std::swap(*this, other);
+        std::swap(_content, other._content);
         return *this;
     }
     template <class T>
@@ -1031,7 +1031,7 @@ private:
             return Release();
         }
         _outbuffer.MoveReadOffset(ret);
-        if (_outbuffer.ReadAbleSize() < 0)
+        if (_outbuffer.ReadAbleSize() == 0)
         {
             _channel.RevWriteEvent();
         }
@@ -1156,7 +1156,7 @@ private:
 
 public:
     Connection(int con_id, int socketfd, EventLoop *loop)
-        : _channel(_socketfd, loop), _sock(socketfd), _loop(loop), _socketfd(socketfd), _statu(CONNECTING), _enable_inactive_release(false)
+        : _channel(_socketfd, loop), _sock(socketfd), _loop(loop), _socketfd(socketfd), _statu(CONNECTING), _enable_inactive_release(false), _con_id(con_id)
     {
         _channel.SetCloseCallBack(std::bind(&Connection::HandleClose, this));
         _channel.SetErrorCallBack(std::bind(&Connection::HandleError, this));
@@ -1215,153 +1215,268 @@ public:
         _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn, msg, closed, event));
     }
 };
-
+void Channel::Update()
+{
+    _loop->EventUpdate_eventloop(this);
+}
 void Channel::Rev()
 {
     _loop->EventRev_eventloop(this);
 }
 void TimeWhell::cancel(uint64_t id)
 {
-    loop->RunInLoop(std::bind(&TimeWhell::cancelInLoop,this,id));
+    loop->RunInLoop(std::bind(&TimeWhell::cancelInLoop, this, id));
 }
 void TimeWhell::addtimewhell(uint64_t id, uint32_t timeout, const TaskFun &fun)
 {
-    loop->RunInLoop(std::bind(&TimeWhell::addtimewhellInLoop,this,id,timeout,fun));
+    loop->RunInLoop(std::bind(&TimeWhell::addtimewhellInLoop, this, id, timeout, fun));
 }
 void TimeWhell::flush(uint64_t id)
 {
-    loop->RunInLoop(std::bind(&TimeWhell::flushInLoop,this,id));
+    loop->RunInLoop(std::bind(&TimeWhell::flushInLoop, this, id));
 }
-
 
 class Acceptor
 {
-    private:
+private:
     Socket _sock;
-    EventLoop* _loop;
+    EventLoop *_loop;
     Channel _channel;
     using AcceptCallBack = std::function<void(int)>;
     AcceptCallBack _acceptcallback;
-    private:
+
+private:
     void HandleRead()
     {
         int newfd = _sock.Accept();
-        if(newfd<0)
+        if (newfd < 0)
         {
-            LOG(LogLevel::ERROR)<<"accept error";
+            LOG(LogLevel::ERROR) << "accept error";
             return;
         }
-        if(_acceptcallback)
+        if (_acceptcallback)
         {
             _acceptcallback(newfd);
         }
     }
-   int CreateServer(int port)
+    int CreateServer(int port)
     {
-        bool ret = _sock.CreateServer(port);
-        if(ret == false)
+        bool ret = _sock.CreateServer(port, "0.0.0.0", true);
+        if (ret == false)
         {
-            return;
+            LOG(LogLevel::ERROR) << "create listening socket error";
+            abort();
         }
         return _sock.Fd();
     }
-    public:
-    Acceptor(EventLoop* loop,int port)
-    :_loop(loop)
-    ,_sock(CreateServer(port))
-    ,_channel(_sock.Fd(),loop)
+
+public:
+    Acceptor(EventLoop *loop, int port)
+        : _sock(), _loop(loop), _channel(CreateServer(port), loop)
     {
-        _channel.SetReadCallBack(std::bind(&Acceptor::HandleRead,this));
+        _channel.SetReadCallBack(std::bind(&Acceptor::HandleRead, this));
     }
     void Listen()
     {
-        _channel.RevReadEvent();
+        _channel.SetReadEvent();
     }
-    void SetAcceptCallBack(AcceptCallBack& cb)
+    void SetAcceptCallBack(const AcceptCallBack &cb)
     {
-        _acceptcallback=cb;
+        _acceptcallback = cb;
     }
 };
 
 class LoopThread
 {
-    private:
+private:
     std::mutex _mutex;
     std::condition_variable _cond;
-    EventLoop* _loop;
+    EventLoop *_loop;
     std::thread _thread;
-    private:
-      void ThreadEntry()
-      {
+
+private:
+    void ThreadEntry()
+    {
         EventLoop loop;
         {
             std::unique_lock<std::mutex> _lock(_mutex);
-            _loop=&loop;
+            _loop = &loop;
             _cond.notify_all();
         }
         loop.Start();
-      }
+    }
 
-
-    public:
+public:
     LoopThread()
-    :_loop(NULL)
-    ,_thread(std::thread(&LoopThread::ThreadEntry,this))
+        : _loop(NULL), _thread(std::thread(&LoopThread::ThreadEntry, this))
     {
     }
-    EventLoop * Get()
+    EventLoop *Get()
     {
-       EventLoop* loop=NULL;
+        EventLoop *loop = NULL;
         {
             std::unique_lock<std::mutex> _lock(_mutex);
-            _cond.wait(_lock,[&](){return _loop!=NULL;});
-            loop=_loop;
+            _cond.wait(_lock, [&]()
+                       { return _loop != NULL; });
+            loop = _loop;
         }
         return loop;
     }
 };
 
-
 class LoopThreadPool
 {
-    private:
+private:
     int _thread_count;
     int _next_id;
-    std::vector<LoopThread*> _threads;
-    std::vector<EventLoop*> _loops;
-    EventLoop* _basicloop;
-    public:
-    LoopThreadPool(EventLoop* basicloop)
-    :_basicloop(basicloop)
-    ,_thread_count(0)
-    ,_next_id(0)
+    std::vector<LoopThread *> _threads;
+    std::vector<EventLoop *> _loops;
+    EventLoop *_basicloop;
+
+public:
+    LoopThreadPool(EventLoop *basicloop)
+        : _basicloop(basicloop), _thread_count(0), _next_id(0)
     {
     }
     void Setthreadcount(int n)
     {
-        _thread_count=n;
+        _thread_count = n;
     }
     void Create()
     {
-        if(_thread_count>0)
+        if (_thread_count > 0)
         {
             _threads.resize(_thread_count);
             _loops.resize(_thread_count);
-            for(int i=0;i<_thread_count;i++)
+            for (int i = 0; i < _thread_count; i++)
             {
-                _threads[i]=new LoopThread();
-                _loops[i]=_threads[i]->Get();
+                _threads[i] = new LoopThread();
+                _loops[i] = _threads[i]->Get();
             }
         }
         return;
     }
-    EventLoop* Next()
+    EventLoop *Next()
     {
-        if(_thread_count==0)
+        if (_thread_count == 0)
         {
             return _basicloop;
         }
-        _next_id=(_next_id+1)%_thread_count;
+        _next_id = (_next_id + 1) % _thread_count;
         return _loops[_next_id];
     }
 };
+
+class TcpServer
+{
+private:
+    uint64_t _next_id;
+    int _port;
+    int _timeout;
+    bool _enable_inactive_release;
+    EventLoop _basicloop;
+    LoopThreadPool _loops;
+    std::unordered_map<uint64_t, PtrConnection> _connections;
+    Acceptor _acceptor;
+    using ConnectedCallback = std::function<void(const PtrConnection &)>;
+    using MessageCallback = std::function<void(const PtrConnection &, Buffer *)>;
+    using ClosedCallback = std::function<void(const PtrConnection &)>;
+    using AnyEventCallback = std::function<void(const PtrConnection &)>;
+    using Functor = std::function<void()>;
+    ConnectedCallback _connection_callback;
+    MessageCallback _message_callback;
+    ClosedCallback _closed_callback;
+    AnyEventCallback _event_callback;
+
+private:
+    void RunAfterInloop(int delay, Functor &cb)
+    {
+        _next_id++;
+        _basicloop.TimerAdd(_next_id, delay, cb);
+    }
+    void NewConnection(int fd)
+    {
+        _next_id++;
+        PtrConnection conn(new Connection(_next_id, fd, _loops.Next()));
+        conn->SetMessageCallback(_message_callback);
+        conn->SetConnectedCallback(_connection_callback);
+        conn->SetAnyEventCallback(_event_callback);
+        conn->SetClosedCallback(_closed_callback);
+        conn->SetSrvClosedCallback(std::bind(&TcpServer::EraseConnection, this, std::placeholders::_1));
+        if (_enable_inactive_release == true)
+        {
+            conn->EnableInactiveRelease(_timeout);
+        }
+        conn->Established();
+        _connections.insert({_next_id, conn});
+    }
+    void EraseConnectionInLoop(const PtrConnection &conn)
+    {
+        int id = conn->Id();
+        auto it = _connections.find(id);
+        if (it != _connections.end())
+        {
+            _connections.erase(it);
+        }
+    }
+    void EraseConnection(const PtrConnection &conn)
+    {
+        _basicloop.RunInLoop(std::bind(&TcpServer::EraseConnectionInLoop, this, conn));
+    }
+
+public:
+    TcpServer(int port)
+        : _next_id(0), _port(port), _timeout(0), _enable_inactive_release(false),
+          _basicloop(), _loops(&_basicloop), _acceptor(&_basicloop, _port)
+    {
+        _acceptor.SetAcceptCallBack(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
+        _acceptor.Listen();
+    }
+
+    void SetThreadCount(int count)
+    {
+        _loops.Setthreadcount(count);
+    }
+    void SetMessageCallback(const MessageCallback &cb)
+    {
+        _message_callback = cb;
+    }
+    void SetConnectedCallback(const ConnectedCallback &cb)
+    {
+        _connection_callback = cb;
+    }
+    void SetAnyEventCallback(const AnyEventCallback &cb)
+    {
+        _event_callback = cb;
+    }
+    void SetClosedCallback(const ClosedCallback &cb)
+    {
+        _closed_callback = cb;
+    }
+    void RunAfter(int delay, Functor &cb)
+    {
+        _basicloop.RunInLoop(std::bind(&TcpServer::RunAfterInloop, this, delay, cb));
+    }
+    void EnableInactiveRelease(int timeout)
+    {
+        _timeout = timeout;
+        _enable_inactive_release = true;
+    }
+    void Start()
+    {
+        _loops.Create();
+        _basicloop.Start();
+    }
+};
+
+class NetWork
+{
+public:
+    NetWork()
+    {
+        // DBG_LOG("SIGPIPE INIT");
+        LOG(LogLevel::DEBUG) << "SIGPIPE INIT";
+        signal(SIGPIPE, SIG_IGN);
+    }
+};
+static NetWork nw;
