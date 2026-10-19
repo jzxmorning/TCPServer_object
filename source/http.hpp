@@ -2,6 +2,7 @@
 #include <string>
 #include <fstream>
 #include "Log.hpp"
+#include <regex>
 #include <vector>
 #include <unordered_map>
 #include <sys/stat.h>
@@ -336,5 +337,208 @@ public:
             level++;
         }
         return true;
+    }
+};
+
+class HttpResponse
+{
+public:
+    int _statu;
+    bool _redirect_flag;
+    std::string _body;
+    std::string _redirect_url;
+    std::unordered_map<std::string, std::string> _headers;
+
+public:
+    HttpResponse()
+        : _statu(200), _redirect_flag(false)
+    {
+    }
+    HttpResponse(int statu)
+        : _statu(statu), _redirect_flag(false)
+    {
+    }
+    void Reset()
+    {
+        _statu = 200;
+        _redirect_flag = false;
+        _body.clear();
+        _redirect_url.clear();
+        _headers.clear();
+    }
+    void SetHeader(const std::string &key, const std::string &val)
+    {
+        _headers.insert({key, val});
+    }
+    bool HasHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it != _headers.end())
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    std::string GetHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+        {
+            return "";
+        }
+        return it->second;
+    }
+    void SetContent(const std::string &body, const std::string &type = "text/html")
+    {
+        _body = body;
+        SetHeader("Content-Type", type);
+    }
+    void SetRedirect(const std::string &url, int statu = 302)
+    {
+        _redirect_flag = true;
+        _redirect_url = url;
+        _statu = statu;
+    }
+    bool Close()
+    {
+        if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive")
+        {
+            return false;
+        }
+        return true;
+    }
+};
+
+class HTTPRequest
+{
+public:
+    std::string _body;   // 请求正文
+    std::string _method; // 请求方法
+    std::string _path;   // 请求资源路径
+    std::string _version;
+    std::smatch _matches;
+    std::unordered_map<std::string, std::string> _headers;
+    std::unordered_map<std::string, std::string> _params;
+
+public:
+    void SetHeader(const std::string &key, const std::string &val)
+    {
+        _headers.insert({key, val});
+    }
+    bool HasHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it != _headers.end())
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    std::string GetHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+        {
+            return "";
+        }
+        return it->second;
+    }
+    void SetContent(const std::string &body, const std::string &type = "text/html")
+    {
+        _body = body;
+        SetHeader("Content-Type", type);
+    }
+    void SetParam(const std::string &key, const std::string &val)
+    {
+        _params.insert({key, val});
+    }
+    bool HasParam(const std::string &key)
+    {
+        auto it = _params.find(key);
+        if (it != _params.end())
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    std::string GetParam(const std::string &key)
+    {
+        auto it = _params.find(key);
+        if (it == _params.end())
+        {
+            return "";
+        }
+        return it->second;
+    }
+    size_t ContentLength()
+    {
+        bool ret = HasHeader("Content-Length");
+        if (ret == false)
+        {
+            return 0;
+        }
+        std::string temp = GetHeader("Content-Length");
+        return std::stol(temp);
+    }
+    bool Close()
+    {
+        if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive")
+        {
+            return false;
+        }
+        return true;
+    }
+};
+
+typedef enum
+{
+    RECV_HTTP_ERROR,
+    RECV_HTTP_LINE,
+    RECV_HTTP_HEAD,
+    RECV_HTTP_BODY,
+    RECV_HTTP_OVER
+} HttpRecvStatu;
+
+class HTTPContext
+{
+private:
+    HttpRecvStatu _rcv_statu; // 解析状态
+    int _resp_statu;          // 相应状态码
+    HTTPRequest _request;
+
+private:
+    bool ParseHttpLine(const std::string &line)
+    {
+        std::regex res("(GET|HEAD|POST|PUT|DELETE) ([^?]*)(?:\\?(.*))? (HTTP\\/1\\.[01])(?:\n|\r\n)?", std::regex::icase);
+        std::smatch matches;
+        bool ret = std::regex_match(line, matches, res);
+        if (ret == false)
+        {
+            return false;
+        }
+        // 0 : get /baidu/login?user=xiaoming&pass=123123 HTTP/1.1
+        // 1 : get
+        // 2 : /baidu/login
+        // 3 : user=xiaoming&pass=123123
+        // 4 : HTTP/1.1
+        _request._method = matches[1];
+        std::transform(_request._method.begin(), _request._method.end(), _request._method.begin(), ::toupper);
+        _request._path = Util::UrlDecode(matches[2],false);
+        _request._version = matches[4];
+        std::vector<std::string> temp;
+        Util::Split(matches[3],"&",&temp);
+        for(auto& v: temp)
+        {
+            
+        }
     }
 };
